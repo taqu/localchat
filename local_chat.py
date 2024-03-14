@@ -1,10 +1,10 @@
 import io
 import logging
 import os
-import asyncio
-import openpyxl
-from pptx import Presentation
+from distutils.util import strtobool
 
+import langchain
+import openpyxl
 import streamlit as st
 import transformers
 from chromadb.config import Settings
@@ -26,7 +26,9 @@ from langchain.chains import LLMChain
 from langchain.chains import RetrievalQAWithSourcesChain
 from langchain.chains.conversation.prompt import PROMPT
 from langchain.chains.retrieval_qa.base import RetrievalQA
+from langchain.memory import ConversationBufferMemory
 from langchain.memory import ConversationBufferWindowMemory
+from langchain.prompts import load_prompt
 from langchain.prompts.chat import AIMessagePromptTemplate
 from langchain.prompts.chat import ChatPromptTemplate
 from langchain.prompts.chat import HumanMessagePromptTemplate
@@ -44,28 +46,30 @@ from langchain.tools import BaseTool
 from langchain.tools import StructuredTool
 from langchain.tools import Tool
 from langchain_community.callbacks import get_openai_callback
+from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_community.chat_models import ChatOllama
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import Ollama
 from langchain_community.utilities import GoogleSearchAPIWrapper
 from langchain_community.vectorstores import Chroma
+from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI
 from langchain_openai.llms.base import OpenAI
+from pptx import Presentation
 from PyPDF2 import PdfReader
-from langchain.memory import ConversationBufferMemory
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
 
 load_dotenv()
+langchain.debug = True
+
 api_base = os.environ['API_BASE']
 vectordb_host = os.environ['VECTORDB_HOST']
 vectordb_port = os.environ['VECTORDB_PORT']
 global_cache_dir = 'models'
-global_log_verbosity = True
+global_log_verbosity = bool(strtobool(os.environ['LOG_VERBOSE']))
 logger = logging.getLogger(st.__name__)
 logger.setLevel(logging.INFO)
 model_id_gemma = 0
@@ -99,7 +103,7 @@ def get_vectordb_web():
     """
     model_kwargs = {'device': 'cpu'}
     embeddings = get_local_embeddings()
-    return Chroma(embedding_function=embeddings, persist_directory='chroma_web')
+    return Chroma(collection_name='chroma_web', embedding_function=embeddings)# persist_directory='chroma_web')
 
 @st.cache_resource
 def get_vectordb_doc():
@@ -111,7 +115,7 @@ def get_vectordb_doc():
     """
     model_kwargs = {'device': 'cpu'}
     embeddings = get_local_embeddings()
-    return Chroma(embedding_function=embeddings, persist_directory='chroma_doc')
+    return Chroma(collection_name='chroma_doc', embedding_function=embeddings)#, persist_directory='chroma_doc')
 
 @st.cache_resource
 def get_vectordb_server(collection_name):
@@ -156,26 +160,13 @@ def get_session_history(session_id: str) -> BaseChatMessageHistory:
 #def get_fasttext():
 #    return fasttext.load_model('models/lid.176.bin')
 
-def get_stop_sequences():
-    """
-    Get stop sequences for a model.
-    Returns
-    -------
-    stop sequences
-    """
-    if model_id_gemma == st.session_state.model_id:
-        return ["### 入力","\n\n### 指示"]
-    
-    if model_id_gpt3 == st.session_state.model_id:
-        return None
-
 ### Prompt templates
 ####################
-CHAT_TEMPLATE_GEMMA_JA = "あなたは誠実で優秀な日本人のAIです。ユーザのメッセージに対して、短く豊かな返信文を作成してください。"
-CHAT_PROMPT_GEMMA_JA = ChatPromptTemplate(
+CHAT_TEMPLATE_JA = "あなたは誠実で優秀な日本人のAIです。ユーザのメッセージに対して、短く豊かな返信文を作成してください。"
+CHAT_PROMPT_JA = ChatPromptTemplate(
     messages=[
         SystemMessagePromptTemplate.from_template(
-            CHAT_TEMPLATE_GEMMA_JA
+            CHAT_TEMPLATE_JA
         ),
         # The `variable_name` here is what must align with memory
         MessagesPlaceholder(variable_name="history"),
@@ -183,11 +174,11 @@ CHAT_PROMPT_GEMMA_JA = ChatPromptTemplate(
     ]
 )
 
-CHAT_TEMPLATE_GEMMA_EN = "You are a honest and excelent AI. Please compose short and rich replies to human messages."
-CHAT_PROMPT_GEMMA_EN = ChatPromptTemplate(
+CHAT_TEMPLATE_EN = "You are a honest and excelent AI. Please compose short and rich replies to human messages."
+CHAT_PROMPT_EN = ChatPromptTemplate(
     messages=[
         SystemMessagePromptTemplate.from_template(
-            CHAT_TEMPLATE_GEMMA_EN
+            CHAT_TEMPLATE_EN
         ),
         # The `variable_name` here is what must align with memory
         MessagesPlaceholder(variable_name="history"),
@@ -195,75 +186,123 @@ CHAT_PROMPT_GEMMA_EN = ChatPromptTemplate(
     ]
 )
 
-def get_prompt_template_conversation(language:int):
+def get_chat_prompt():
     if model_id_gemma == st.session_state.model_id:
-        if language_ja == language:
-            return CHAT_PROMPT_GEMMA_JA
+        if language_ja == st.session_state.language:
+            return CHAT_PROMPT_JA
         else:
-            return CHAT_PROMPT_GEMMA_EN
+            return CHAT_PROMPT_EN
 
     if model_id_gpt3 == st.session_state.model_id:
         return PROMPT
 
-DEFAULT_SEARCH_TEMPLATE_JA =\
-"""<s>[INST] <<SYS>>
-あなたはGoogle検索の結果を改善するアシスタントです。
-<</SYS>>
+SEARCH_QUERY_TEMPLATE_JA =\
+"""あなたはGoogle検索の結果を改善するアシスタントです。
+次の質問に似たGoogle検索のクエリを3つ作ってください。出力クエリは番号付きのリストで返してください。: {question}"""
 
-
-次の質問に似たGoogle検索のクエリを3つ作ってください。出力は番号付きのリストで返してください。: {question} [/INST]"""
-
-DEFAULT_SEARCH_PROMPT_JA = PromptTemplate(
+SEARCH_QUERY_PROMPT_JA = PromptTemplate(
     input_variables=["question"],
-    template=DEFAULT_SEARCH_TEMPLATE_JA,
+    template=SEARCH_QUERY_TEMPLATE_JA,
 )
 
-DEFAULT_SEARCH_TEMPLATE_EN =\
-"""<s>[INST] <<SYS>>
-You are an assistant tasked with improving Google search results.
-<</SYS>>
+SEARCH_QUERY_TEMPLATE_EN =\
+"""You are an assistant tasked with improving Google search results.
+Generate THREE Google search queries that are similar to this question. The output should be a numbered list of queries.: {question}"""
 
-
-Generate THREE Google search queries that are similar to this question. The output should be a numbered list of questions.: {question} [/INST]"""
-
-DEFAULT_SEARCH_PROMPT_EN = PromptTemplate(
+SEARCH_QUERY_PROMPT_EN = PromptTemplate(
     input_variables=["question"],
-    template=DEFAULT_SEARCH_TEMPLATE_EN,
+    template=SEARCH_QUERY_TEMPLATE_EN,
 )
 
-def get_prompt_template_websearch():
+def get_search_query_prompt():
     if model_id_gpt3 == st.session_state.model_id:
-        return None
-    if model_id_gemma == st.session_state.model_id:
         return None
 
     if language_ja == st.session_state.language:
-        return DEFAULT_SEARCH_PROMPT_JA
+        return SEARCH_QUERY_PROMPT_JA
     else:
-        return DEFAULT_SEARCH_PROMPT_EN
+        return SEARCH_QUERY_PROMPT_EN
 
-#def predict_language(text:str):
-#    model = get_fasttext()
-#    text = text.replace('\n', '')
-#    text = text.replace('\r', '')
-#    label, prob = model.predict(text)
-#    if len(label)<=0 or not label[0]:
-#        return 'en'
-#    return label[0].replace('__label__', '')
+QA_BASE_PROMPT_JA = PromptTemplate(input_variables=['page_content', 'source'], template='Content: {page_content}\nSource: {source}')
+QA_BASE_PROMPT_EN = PromptTemplate(input_variables=['page_content', 'source'], template='Content: {page_content}\nSource: {source}')
 
-#def trans_ja_en(text):
-#    tlock = threading.Lock()
-#    with tlock:
-#        trans_ja_en = get_trans_ja_en()
-#        translated = trans_ja_en(text) 
-#        return translated[0]['translation_text']
+QA_QUESTION_PROMPT_JA = PromptTemplate(
+    input_variables=['context', 'question'],
+    template='長い文章の次の部分を使って、質問に答えるために関連する文章があるか確認してください。\n関連するテキストをそのまま返してください。\n{context}\n質問: {question}\nもしあれば、関連する文章:')
 
-#def trans_en_ja(text):
-#    tlock = threading.Lock()
-#    with tlock:
-#        trans_en_ja = get_trans_en_ja()
-#        translated = trans_en_ja(text)
-#        return translated[0]['translation_text']
+QA_QUESTION_PROMPT_EN = PromptTemplate(
+    input_variables=['context', 'question'],
+    template='Use the following portion of a long document to see if any of the text is relevant to answer the question. \nReturn any relevant text verbatim.\n{context}\nQuestion: {question}\nRelevant text, if any:')
+
+QA_COMBINE_TEMPLATE_JA =\
+"""Given the following extracted parts of a long document and a question, create a final answer with references ("SOURCES").
+If you don\'t know the answer, just say that you don\'t know. Don\'t try to make up an answer.
+ALWAYS return a "SOURCES" part in your answer.
+SOURCES:
+{summaries}
+
+QUESTION: {question}
+
+FINAL ANSWER:
+"""
+QA_COMBINE_PROMPT_JA = PromptTemplate(input_variables=['question', 'summaries'], template=QA_COMBINE_TEMPLATE_JA)
+
+QA_COMBINE_TEMPLATE_EN =\
+"""Given the following extracted parts of a long document and a question, create a final answer with references ("SOURCES").
+If you don\'t know the answer, just say that you don\'t know. Don\'t try to make up an answer.
+ALWAYS return a "SOURCES" part in your answer.
+SOURCES:
+{summaries}
+
+QUESTION: {question}
+
+FINAL ANSWER:
+"""
+QA_COMBINE_PROMPT_EN = PromptTemplate(input_variables=['question', 'summaries'], template=QA_COMBINE_TEMPLATE_EN)
+
+def get_qa_source_prompt():
+    if model_id_gpt3 == st.session_state.model_id:
+        return None
+
+    if language_ja == st.session_state.language:
+        return (QA_BASE_PROMPT_JA, QA_QUESTION_PROMPT_JA, QA_COMBINE_PROMPT_JA) 
+    else:
+        return (QA_BASE_PROMPT_EN, QA_QUESTION_PROMPT_EN, QA_COMBINE_PROMPT_EN)
+
+TEXT_QA_PROMPT_JA =\
+"""次の文脈情報があります。
+
+{context}
+
+事前情報を使わず、与えられた文脈情報を使って、次の質問に答えてください。
+質問: {question}
+"""
+
+TEXT_QA_PROMPT_JA = PromptTemplate(
+    input_variables=['context', 'question'],
+    template = TEXT_QA_PROMPT_JA)
+
+TEXT_QA_PROMPT_EN =\
+"""Context information is below.
+
+{context}
+
+Given the context information and not prior knowledge,
+answer the question: {question}
+"""
+
+TEXT_QA_PROMPT_EN = PromptTemplate(
+    input_variables=['context', 'question'],
+    template = TEXT_QA_PROMPT_EN)
+
+def get_qa_prompt():
+    if model_id_gpt3 == st.session_state.model_id:
+        return None
+
+    if language_ja == st.session_state.language:
+        return TEXT_QA_PROMPT_JA 
+    else:
+        return TEXT_QA_PROMPT_EN
 
 def split_text(text:str):
     splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=40)
@@ -300,25 +339,22 @@ def load_file(file:io.BytesIO):
     return content
 
 def embeddig_file(file:io.BytesIO):
-    text = load_file(file)
-    chunks = split_text(text)
-    vector_db = get_vectordb_doc()
-    vector_db.add_texts(chunks)
-    results = vector_db.similarity_search("Please summarize comparizon of SMAA and other AA methods.")
-    print(results)
-    print('embeddig_file end')
+    with st.spinner('Embedding ...'):
+        text = load_file(file)
+        chunks = split_text(text)
+        vector_db = get_vectordb_doc()
+        vector_db.add_texts(chunks)
 
 def clear_session_state():
-    if 'memory' in st.session_state:
-        st.session_state.memory.clear()
-    else:
-        st.session_state.memory = ConversationBufferWindowMemory(k=4, memory_key="chat_history", return_messages=True)
     if 'history' in st.session_state:
         st.session_state.history.clear()
     else:
         st.session_state.history = ChatMessageHistory()
+    if 'messages' in st.session_state:
+        st.session_state.messages = []
+    else:
+        st.session_state.messages = []
     st.session_state.model = model_id_gemma
-    st.session_state.mode = 0
     st.session_state.language = language_ja 
     st.session_state.upload_file = None
 
@@ -331,57 +367,51 @@ def init_page():
     st.header('😊 Chat Agent 😊')
     st.sidebar.title("Options")
 
+def choose_model(chat_mode=False):
+    if model_id_gemma == st.session_state.model_id:
+        model_name = 'eramax/gemma-7b-it:q4_k_m'
+        if chat_mode:
+            st.session_state.model = ChatOllama(
+                model=model_name,
+                base_url=api_base,
+                temperature=st.session_state.temperature,
+                num_ctx=8192,
+                verbose=global_log_verbosity)
+        else:
+            st.session_state.model = Ollama(
+                model=model_name,
+                base_url=api_base,
+                temperature=st.session_state.temperature,
+                num_ctx=8192,
+                verbose=global_log_verbosity)
+    else:
+        model_name = 'gpt-3.5-turbo'
+        st.session_state.model = OpenAI(
+            temperature=st.session_state.temperature,
+            model_name=model_name,
+            max_tokens=4096,
+            verbose=global_log_verbosity)
+
 def init_options():
     ### Choose a model
     container = st.sidebar.container(border=True)
     model = container.radio('モデル:', ('gemma-7b-it', 'GPT-3.5'))
-    temperature = container.slider('Temerature:', min_value=0.0, max_value=1.0, value=0.1)
+    st.session_state.temperature = container.slider('Temerature:', min_value=0.0, max_value=1.0, value=0.1)
 
-    if model == 'gemma-7b-it':
-        model_name = 'eramax/gemma-7b-it:q4_k_m'
+    if 'gemma-7b-it' == model:
         st.session_state.model_id = model_id_gemma
-        st.session_state.model = ChatOllama(
-            model=model_name,
-            base_url=api_base,
-            temperature=temperature,
-            verbose=global_log_verbosity)
-
     else:
-        model_name = 'gpt-3.5-turbo'
         st.session_state.model_id = model_id_gpt3
-        st.session_state.model = OpenAI(
-            temperature=temperature,
-            model_name=model_name,
-            max_tokens=2048,
-            verbose=global_log_verbosity)
 
     ### Choose a language
     container = st.sidebar.container(border=True)
-    modes = {0: "日本語", 1: "English"}
+    languages = {0: "日本語", 1: "English"}
     def language_format_func(option):
-        return modes[option]
+        return languages[option]
 
-    st.session_state.language = container.selectbox("Language:", options=list(modes.keys()), format_func=language_format_func)
+    st.session_state.language = container.selectbox("Language:", options=list(languages.keys()), format_func=language_format_func)
 
-    ### Choose a mode
-    container = st.sidebar.container(border=True)
-    modes = {0: "Chat", 1: "検索", 2: "ドキュメント"}
-    def format_func(option):
-        return modes[option]
 
-    st.session_state.mode = container.selectbox("Mode:", options=list(modes.keys()), format_func=format_func)
-
-    ### Mode specific options
-    if 0 == st.session_state.mode:
-        pass
-    elif 1 == st.session_state.mode:
-        st.session_state.use_googlesearch = container.checkbox('Google検索')
-    elif 2 == st.session_state.mode:
-        st.session_state.upload_file = container.file_uploader(label='ドキュメント:', type=['pdf', 'txt', 'text', 'xlsx', 'csv', 'html', 'ppt', 'pptx'])
-        if st.session_state.upload_file:
-            embeddig_file(st.session_state.upload_file)
-    else:
-        pass
 
 def init_messages():
     clear_button = st.sidebar.button('Clear Conversation', key='clear')
@@ -389,7 +419,8 @@ def init_messages():
         clear_session_state()
 
 def invoke_chat_chain(user_input:str):
-    prompt = get_prompt_template_conversation(st.session_state.language)
+    choose_model(chat_mode=True)
+    prompt = get_chat_prompt()
     chain = prompt | st.session_state.model | StrOutputParser()
     with_message_history = RunnableWithMessageHistory(
         chain,
@@ -400,6 +431,7 @@ def invoke_chat_chain(user_input:str):
     return with_message_history.invoke({'input': user_input}, {'configurable': {'session_id': '[0]'}})
 
 def invoke_search_chain(user_input:str):
+    choose_model()
     vectorstore = get_vectordb_web()
     search = get_google_api()
     llm = st.session_state.model
@@ -407,92 +439,118 @@ def invoke_search_chain(user_input:str):
         llm=llm,
         vectorstore=vectorstore,
         search=search,
-        text_splitter=RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=40),
+        text_splitter=RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=30),
         num_search_results=3,
-        prompt=get_prompt_template_websearch(),
+        prompt=get_search_query_prompt(),
     )
-    qa_chain = RetrievalQAWithSourcesChain.from_chain_type(
+    document_prompt, question_prompt, combine_prompt = get_qa_source_prompt()
+    qa_chain = RetrievalQAWithSourcesChain.from_llm(
         llm=llm,
+        document_prompt = document_prompt,
+        question_prompt = question_prompt,
+        combine_prompt = combine_prompt,
         retriever=web_research_retriever,
         max_tokens_limit = 1000,
         verbose=global_log_verbosity,
-        chain_type = 'stuff',
-        chain_type_kwargs={'verbose': global_log_verbosity},
     )
     result = qa_chain.invoke(input=user_input)
     return result['answer']
 
 def invoke_document_chain(user_input:str):
+    choose_model()
     vectorstore = get_vectordb_doc()
     llm = st.session_state.model
-    retriever = vectorstore.as_retriever()
-    qa_chain = RetrievalQA.from_chain_type(
+    retriever = vectorstore.as_retriever(search_kwargs={"k": st.session_state.doc_search_k})
+    document_prompt = get_qa_prompt()
+    qa_chain = RetrievalQA.from_llm(
         llm=llm,
+        prompt = document_prompt,
         retriever=retriever,
-        max_tokens_limit = 1000,
-        return_source_documents = True,
         verbose=global_log_verbosity,
-        chain_type_kwargs={'verbose': global_log_verbosity},
-        )
+    )
     result = qa_chain.invoke(input=user_input)
-    print(result)
-    return 'response'
+    return result['result']
 
-async def output_messages():
+def output_messages(container):
     """
     Output session messages.
     """
-    messages = await st.session_state.history.aget_messages()
-    #messages = st.session_state.get('messages', [])
+    messages = st.session_state.messages
     for message in messages:
         if isinstance(message, AIMessage):
-            with st.chat_message('assistant'):
-                st.markdown(message.content)
+            with container.chat_message('assistant'):
+                container.markdown(message.content)
         elif isinstance(message, HumanMessage):
-            with st.chat_message('user'):
-                st.markdown(message.content)
+            with container.chat_message('user'):
+                container.markdown(message.content)
         else:
             pass
 
-def do_chat_mode():
-    if user_input := st.chat_input('Ask me anything!'):
-        with st.spinner('Chat Agent is typing ...'):
-            response = invoke_chat_chain(user_input=user_input)
-
-    asyncio.run(output_messages())
-
-def do_search_mode():
-    if user_input := st.chat_input('Ask me anything!'):
-        with st.spinner('Chat Agent is typing ...'):
-            response = invoke_search_chain(user_input=user_input)
-        st.session_state.history.add_user_message(HumanMessage(content=user_input))
-        st.session_state.history.add_ai_message(AIMessage(content=response))
-
-    asyncio.run(output_messages())
-
-def do_document_mode():
-    if st.session_state.upload_file:
-        if user_input := st.chat_input('Ask me about the file'):
+def do_chat_mode(container):
+    chat_container = st.container(height=400, border=True)
+    with container:
+        if user_input := container.chat_input('Ask me anything!', key='chat'):
             with st.spinner('Chat Agent is typing ...'):
-                response = invoke_document_chain(user_input=user_input)
+                response = invoke_chat_chain(user_input=user_input)
+                human_message = HumanMessage(content=user_input)
+                ai_message = AIMessage(content=response)
+                st.session_state.messages.append(human_message)
+                st.session_state.messages.append(ai_message)
+    output_messages(chat_container)
 
-            st.session_state.messages.append(HumanMessage(content=user_input))
-            st.session_state.messages.append(AIMessage(content=response))
-    else:
-        st.write('First, upload a file')
+def do_search_mode(container):
+    st.session_state.use_googlesearch = container.checkbox('Google検索')
+    st.session_state.search_k = st.slider('最大検索数:', min_value=1, max_value=10, value=5, step=1)
 
-    asyncio.run(output_messages())
+    chat_container = st.container(height=400, border=True)
+    with container:
+        if user_input := container.chat_input('Ask me anything!', key='search'):
+            with st.spinner('Chat Agent is typing ...'):
+                response = invoke_search_chain(user_input=user_input)
+                human_message = HumanMessage(content=user_input)
+                ai_message = AIMessage(content=response)
+                st.session_state.history.add_user_message(human_message)
+                st.session_state.history.add_ai_message(ai_message)
+                st.session_state.messages.append(human_message)
+                st.session_state.messages.append(ai_message)
+    output_messages(chat_container)
+
+def do_document_mode(container):
+    upload_file = container.file_uploader(label='ドキュメント:', type=['pdf', 'txt', 'text', 'xlsx', 'csv', 'html', 'ppt', 'pptx'])
+    if upload_file != st.session_state.upload_file:
+        st.session_state.upload_file = upload_file
+        embeddig_file(st.session_state.upload_file)
+    st.session_state.doc_search_k = st.slider('最大検索数:', min_value=1, max_value=10, value=3, step=1)
+
+    chat_container = st.container(height=400, border=True)
+    with container:
+        if st.session_state.upload_file:
+            if user_input := container.chat_input('Ask me about the file', key='doc'):
+                with st.spinner('Chat Agent is typing ...'):
+                    response = invoke_document_chain(user_input=user_input)
+                    human_message = HumanMessage(content=user_input)
+                    ai_message = AIMessage(content=response)
+                    st.session_state.history.add_user_message(human_message)
+                    st.session_state.history.add_ai_message(ai_message)
+                    st.session_state.messages.append(human_message)
+                    st.session_state.messages.append(ai_message)
+        else:
+            st.write('First, upload a file')
+    output_messages(chat_container)
 
 def main():
     init_page()
     init_options()
     init_messages()
-    if 0 == st.session_state.mode:
-        do_chat_mode()
-    elif 1 == st.session_state.mode:
-        do_search_mode()
-    elif 2 == st.session_state.mode:
-        do_document_mode()
+    tab_chat, tab_search, tab_doc = st.tabs(['チャット', '検索', '文書'])
+    with tab_chat:
+        do_chat_mode(tab_chat)
+
+    with tab_search:
+        do_search_mode(tab_search)
+
+    with tab_doc:
+        do_document_mode(tab_doc)
 
 if __name__ == '__main__':
     main()

@@ -29,6 +29,8 @@ dependencies = [
     "html2text",
     "pypdf2",
     "chromadb>=0.4.24",
+    "openpyxl",
+    "python-pptx",
 ]
 [tool.setuptools.packages.find]
 exclude = ['chroma_doc', 'chroma_web', 'models', 'env']
