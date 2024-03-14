@@ -1,10 +1,11 @@
 import io
 import logging
 import os
+import uuid
 from distutils.util import strtobool
+from xml.dom.minidom import Document
 
 import langchain
-import openpyxl
 import streamlit as st
 import transformers
 from chromadb.config import Settings
@@ -59,11 +60,15 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI
 from langchain_openai.llms.base import OpenAI
-from pptx import Presentation
-from PyPDF2 import PdfReader
+from langchain_community.document_loaders import UnstructuredPowerPointLoader
+from langchain_community.document_loaders import UnstructuredExcelLoader
+from langchain_community.document_loaders.parsers.pdf import PDFMinerParser
+from langchain_core.document_loaders.blob_loaders import Blob
+from langchain_community.document_loaders.parsers.txt import TextParser
+from langchain_community.document_loaders.csv_loader import CSVLoader
+from langchain.chains.qa_with_sources.vector_db import VectorDBQAWithSourcesChain
 
 load_dotenv()
-langchain.debug = True
 
 api_base = os.environ['API_BASE']
 vectordb_host = os.environ['VECTORDB_HOST']
@@ -76,6 +81,8 @@ model_id_gemma = 0
 model_id_gpt3 = 1
 language_ja = 0
 language_en = 1
+if global_log_verbosity:
+    langchain.debug = True
 
 @st.cache_resource
 def get_local_embeddings():
@@ -92,26 +99,24 @@ def get_local_embeddings():
         model_kwargs = model_kwargs,
         cache_folder=global_cache_dir)
 
-@st.cache_resource
 def get_vectordb_web():
     """
     Get persistent vector db for web scrapping.
 
     Returns
     -------
-    persistent vector db for web search : db instance
+    in-memory vector db for web search : db instance
     """
     model_kwargs = {'device': 'cpu'}
     embeddings = get_local_embeddings()
     return Chroma(collection_name='chroma_web', embedding_function=embeddings)# persist_directory='chroma_web')
 
-@st.cache_resource
 def get_vectordb_doc():
     """
     Get persistent vector db for documents
     Returns
     -------
-    persistent vector db for documents : db instance
+    in-memory vector db for documents : db instance
     """
     model_kwargs = {'device': 'cpu'}
     embeddings = get_local_embeddings()
@@ -123,7 +128,7 @@ def get_vectordb_server(collection_name):
     Get a client server model db.
     Returns
     -------
-    persistent vector : db instance
+    persistent vector server : db instance
     """
     embeddings = get_local_embeddings()
     client_settings = Settings(
@@ -139,29 +144,19 @@ def get_vectordb_server(collection_name):
 
 @st.cache_resource
 def get_google_api():
+    """
+    Get a google api wrapper
+    Returns
+    -------
+    google api wrapper : api wrapper instance
+    """
     return GoogleSearchAPIWrapper()
 
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
     return st.session_state.history
 
-#@st.cache_resource
-#def get_trans_ja_en():
-#    model = MarianMTModel.from_pretrained(pretrained_model_name_or_path='staka/fugumt-ja-en', cache_dir=global_cache_dir)
-#    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path='staka/fugumt-ja-en', cache_dir=global_cache_dir)
-#    return pipeline('translation', model=model, tokenizer=tokenizer)
-
-#@st.cache_resource
-#def get_trans_en_ja():
-#    model = MarianMTModel.from_pretrained(pretrained_model_name_or_path='staka/fugumt-en-ja', cache_dir=global_cache_dir)
-#    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path='staka/fugumt-en-ja', cache_dir=global_cache_dir)
-#    return pipeline('translation', model=model, tokenizer=tokenizer)
-
-#@st.cache_resource
-#def get_fasttext():
-#    return fasttext.load_model('models/lid.176.bin')
-
 ### Prompt templates
-####################
+###########################################################
 CHAT_TEMPLATE_JA = "あなたは誠実で優秀な日本人のAIです。ユーザのメッセージに対して、短く豊かな返信文を作成してください。"
 CHAT_PROMPT_JA = ChatPromptTemplate(
     messages=[
@@ -228,7 +223,7 @@ QA_BASE_PROMPT_EN = PromptTemplate(input_variables=['page_content', 'source'], t
 
 QA_QUESTION_PROMPT_JA = PromptTemplate(
     input_variables=['context', 'question'],
-    template='長い文章の次の部分を使って、質問に答えるために関連する文章があるか確認してください。\n関連するテキストをそのまま返してください。\n{context}\n質問: {question}\nもしあれば、関連する文章:')
+    template='長い文章の次の部分を使って、質問に答えるために関連する文章があるか確認してください。\n関連するテキストをそのまま返してください。\n{context}\n質問: {question}\n関連する文章:')
 
 QA_QUESTION_PROMPT_EN = PromptTemplate(
     input_variables=['context', 'question'],
@@ -303,47 +298,116 @@ def get_qa_prompt():
         return TEXT_QA_PROMPT_JA 
     else:
         return TEXT_QA_PROMPT_EN
+###########################################################
 
 def split_text(text:str):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=40)
+    """
+    Split a string into small documents
+
+    Parameters
+    ----------
+    text : str
+    
+    Returns
+    -------
+    a list of documents : List<Document>
+    """
+    splitter = RecursiveCharacterTextSplitter(chunk_size=st.session_state.doc_chunk_size, chunk_overlap=st.session_state.doc_chunk_overlap)
     return splitter.split_text(text)
 
+def split_docs(docs):
+    """
+    Split each documents into smaller documents
+
+    Parameters
+    ----------
+    docs :
+
+    Returns
+    -------
+    a list of documents : List<Document>
+    """
+    splitter = RecursiveCharacterTextSplitter(chunk_size=st.session_state.doc_chunk_size, chunk_overlap=st.session_state.doc_chunk_overlap)
+    return splitter.split_documents(docs)
+
+def save_local(file:io.BytesIO):
+    """
+    Save bytes into a local file for work, and return it's path.
+
+    Parameters
+    ----------
+    file : io.BytesIO
+
+    Returns
+    -------
+    a local working file path : str
+    """
+    work = os.path.normpath('.\work')
+    os.makedirs(work, exist_ok=True)
+    name = str(uuid.uuid4())
+    path = os.path.join(work, name)
+    try:
+        with open(path, 'wb') as out_file:
+            out_file.write(file.getbuffer())
+    except:
+        return None
+    return path
+
 def load_file(file:io.BytesIO):
-    content = None
+    """
+    Load bytes of a file according to it's mime-type.
+    
+    Parameters
+    ----------
+    file : io.BytesIO
+
+    Returns
+    -------
+    content as a list of Document : List<Document>
+    """
     if 'application/pdf' == file.type:
-        pdf_reader = PdfReader(file)
-        content = '\n'.join([page.extract_text() for page in pdf_reader.pages])
-    elif 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' == file.type:
-        book = openpyxl.load_workbook(file)
-        sheets = book.sheetnames
-        content = []
-        for sheet_name in sheets:
-            sheet = book[sheet_name]
-            cell_list = [f"{cell.value}" for cells in tuple(sheet.columns) for cell in cells]
-            content.extend(cell_list)
-    elif 'application/vnd.openxmlformats-officedocument.presentationml.presentation' == file.type:
-        presentation = Presentation(file)
-        content = []
-        for slide in presentation.slides:
-            for shape in slide.shapes:
-                if not shape.has_text_frame:
-                    continue
-                for par in shape.text_frame.paragraphs:
-                    for run in par.runs:
-                        content.append(run.text)
-    elif 'text/plain' == file.type or 'text/csv' == file.type:
-        content = file.read().decode('UTF-8')
+        blob = Blob(data=file.getvalue(), mimetype=file.type, path=file.name)
+        pdf_reader = PDFMinerParser()
+        return pdf_reader.parse(blob)
+
+    elif 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' == file.type or 'application/vnd.ms-excel' == file.type:
+        path = save_local(file)
+        print(path)
+        loader = UnstructuredExcelLoader(path)
+        return loader.load()
+
+    elif 'application/vnd.openxmlformats-officedocument.presentationml.presentation' == file.type or 'application/vnd.ms-powerpoint' == file.type:
+        path = save_local(file)
+        print(path)
+        loader = UnstructuredPowerPointLoader(path)
+        return loader.load()
+
+    elif 'text/plain' == file.type:
+        blob = Blob(data=file.getvalue(), mimetype=file.type, path=file.name)
+        text_parser = TextParser()
+        return text_parser.parse(blob)
+
+    elif 'text/csv' == file.type:
+        path = save_local(file)
+        print(path)
+        loader = CSVLoader(file_path=path)
+        return loader.load()
     else:
         return None
-    file.seek(0)
-    return content
 
 def embeddig_file(file:io.BytesIO):
+    """
+    Embedding content of a file into the vector db for documents.
+    
+    Parameters
+    ----------
+    file : io.BytesIO
+    """
     with st.spinner('Embedding ...'):
-        text = load_file(file)
-        chunks = split_text(text)
+        docs = load_file(file)
+        chunks = split_docs(docs)
         vector_db = get_vectordb_doc()
-        vector_db.add_texts(chunks)
+        vector_db.add_documents(chunks)
 
 def clear_session_state():
     if 'history' in st.session_state:
@@ -368,6 +432,14 @@ def init_page():
     st.sidebar.title("Options")
 
 def choose_model(chat_mode=False):
+    """
+    Choose a LLM model by user choosed session state, and set to the session state.
+    
+    Parameters
+    ----------
+    chat_mode : boolean
+        Use to select a chat model or simple generation model.
+    """
     if model_id_gemma == st.session_state.model_id:
         model_name = 'eramax/gemma-7b-it:q4_k_m'
         if chat_mode:
@@ -375,14 +447,14 @@ def choose_model(chat_mode=False):
                 model=model_name,
                 base_url=api_base,
                 temperature=st.session_state.temperature,
-                num_ctx=8192,
+                num_ctx=6000,
                 verbose=global_log_verbosity)
         else:
             st.session_state.model = Ollama(
                 model=model_name,
                 base_url=api_base,
                 temperature=st.session_state.temperature,
-                num_ctx=8192,
+                num_ctx=6000,
                 verbose=global_log_verbosity)
     else:
         model_name = 'gpt-3.5-turbo'
@@ -411,8 +483,6 @@ def init_options():
 
     st.session_state.language = container.selectbox("Language:", options=list(languages.keys()), format_func=language_format_func)
 
-
-
 def init_messages():
     clear_button = st.sidebar.button('Clear Conversation', key='clear')
     if clear_button or 'history' not in st.session_state:
@@ -439,10 +509,11 @@ def invoke_search_chain(user_input:str):
         llm=llm,
         vectorstore=vectorstore,
         search=search,
-        text_splitter=RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=30),
-        num_search_results=3,
+        text_splitter=RecursiveCharacterTextSplitter(chunk_size=st.session_state.web_chunk_size, chunk_overlap=st.session_state.web_chunk_overlap),
+        num_search_results=st.session_state.web_search_k,
         prompt=get_search_query_prompt(),
     )
+    # Construct from 'from_llm' to use custom prompts
     document_prompt, question_prompt, combine_prompt = get_qa_source_prompt()
     qa_chain = RetrievalQAWithSourcesChain.from_llm(
         llm=llm,
@@ -461,6 +532,7 @@ def invoke_document_chain(user_input:str):
     vectorstore = get_vectordb_doc()
     llm = st.session_state.model
     retriever = vectorstore.as_retriever(search_kwargs={"k": st.session_state.doc_search_k})
+    # Construct from 'from_llm' to use custom prompts
     document_prompt = get_qa_prompt()
     qa_chain = RetrievalQA.from_llm(
         llm=llm,
@@ -474,6 +546,11 @@ def invoke_document_chain(user_input:str):
 def output_messages(container):
     """
     Output session messages.
+
+    Parameters
+    ----------
+    container :
+        Tab's container to show messages
     """
     messages = st.session_state.messages
     for message in messages:
@@ -500,13 +577,19 @@ def do_chat_mode(container):
 
 def do_search_mode(container):
     st.session_state.use_googlesearch = container.checkbox('Google検索')
-    st.session_state.search_k = st.slider('最大検索数:', min_value=1, max_value=10, value=5, step=1)
+    st.session_state.web_search_k = container.slider('最大検索数:', min_value=1, max_value=10, value=4, step=1, key='slider_web_search_k')
+    st.session_state.web_chunk_size = container.slider('チャンクサイズ:', min_value=100, max_value=500, value=400, step=10, key='slider_web_chunk_size')
+    st.session_state.web_chunk_overlap = container.slider('チャンクオーバーラップ:', min_value=0, max_value=100, value=20, step=1, key='slider_web_chunk_overlap')
 
     chat_container = st.container(height=400, border=True)
     with container:
         if user_input := container.chat_input('Ask me anything!', key='search'):
             with st.spinner('Chat Agent is typing ...'):
-                response = invoke_search_chain(user_input=user_input)
+                response = None
+                if st.session_state.use_googlesearch:
+                    response = invoke_search_chain(user_input=user_input)
+                else:
+                    response = invoke_chat_chain(user_input=user_input)
                 human_message = HumanMessage(content=user_input)
                 ai_message = AIMessage(content=response)
                 st.session_state.history.add_user_message(human_message)
@@ -516,11 +599,14 @@ def do_search_mode(container):
     output_messages(chat_container)
 
 def do_document_mode(container):
+    st.session_state.doc_search_k = container.slider('最大検索数:', min_value=1, max_value=10, value=4, step=1, key='slider_doc_search_k')
+    st.session_state.doc_chunk_size = container.slider('チャンクサイズ:', min_value=100, max_value=500, value=400, step=10, key='slider_doc_chunk_size')
+    st.session_state.doc_chunk_overlap = container.slider('チャンクオーバーラップ:', min_value=0, max_value=100, value=20, step=1, key='slider_doc_chunk_overlap')
+
     upload_file = container.file_uploader(label='ドキュメント:', type=['pdf', 'txt', 'text', 'xlsx', 'csv', 'html', 'ppt', 'pptx'])
     if upload_file != st.session_state.upload_file:
         st.session_state.upload_file = upload_file
         embeddig_file(st.session_state.upload_file)
-    st.session_state.doc_search_k = st.slider('最大検索数:', min_value=1, max_value=10, value=3, step=1)
 
     chat_container = st.container(height=400, border=True)
     with container:

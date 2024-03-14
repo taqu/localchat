@@ -27,10 +27,8 @@ dependencies = [
     "sentence-transformers",
     "bs4",
     "html2text",
-    "pypdf2",
     "chromadb>=0.4.24",
-    "openpyxl",
-    "python-pptx",
+    "pdfminer-six",
 ]
 [tool.setuptools.packages.find]
 exclude = ['chroma_doc', 'chroma_web', 'models', 'env']

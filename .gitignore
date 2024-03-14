@@ -31,9 +31,8 @@
 *.out
 *.app
 .env
+/build
 /.vs
-/chroma_doc
-/chroma_web
 /env
 /localchat.egg-info
 /models
